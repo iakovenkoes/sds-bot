@@ -8,6 +8,7 @@ permissions: {}
 jobs:
   connect:
     runs-on: ubuntu-latest
+    environment: BOT_TOKEN
     steps:
       - name: Register webhook
         env:
@@ -15,7 +16,7 @@ jobs:
           WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
         run: |
           if [[ -z "$BOT_TOKEN" || -z "$WEBHOOK_SECRET" ]]; then
-            echo "Add both repository secrets before running this workflow."
+            echo "Check BOT_TOKEN and TELEGRAM_WEBHOOK_SECRET in the BOT_TOKEN environment."
             exit 1
           fi
 
