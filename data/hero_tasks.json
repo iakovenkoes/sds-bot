@@ -1,0 +1,206 @@
+{
+  "version": "1.7-source-unchanged",
+  "source_document": "https://docs.google.com/document/d/12RhO4kIh5nP8cFmVYG0rd4tXELHCaDv980bejIPCZlE/edit?tab=t.sv5hdkgpl83m",
+  "timezone": "Europe/Moscow",
+  "notes": [
+    "Тексты и веса из источника, проверка человеком, без частичного зачёта",
+    "В Action входят задания блока «Погружение»; показываются участникам с 28 ноября 10:00",
+    "source содержит ответы для администраторов; в этот JSON они сознательно не включены",
+    "Неточные перемешанные события, фотоальбомы и число команд уточняют организаторы; не блокируют первый этап разработки"
+  ],
+  "stages": [
+    {
+      "id": "stage_1",
+      "title": "Research",
+      "internal_role": "pretrip",
+      "open_at": "2026-11-21",
+      "close_at": "2026-11-27T23:59:00+03:00",
+      "tasks": [
+        {
+          "id": "research_1",
+          "number": 1,
+          "text": "Кто был главным героем PR OFFSCREEN PARTY’26?",
+          "points": 1,
+          "response_type": "text",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "research_2",
+          "number": 2,
+          "text": "Какое имя самое распространённое среди членов Малого совета 2026/27?",
+          "points": 2,
+          "response_type": "text",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "research_3",
+          "number": 3,
+          "text": "Найди в Telegram-канале СДС (https://t.me/sdsleep_events) пост за октябрь, у которого больше всего комментариев. Когда он был опубликован?",
+          "points": 3,
+          "response_type": "text",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "research_4",
+          "number": 4,
+          "text": "Какие темы были у мероприятия «Элементарно» за последние два года?",
+          "points": 4,
+          "response_type": "text",
+          "manual_review": true,
+          "max_submissions": 1
+        }
+      ],
+      "display_title": "Архив"
+    },
+    {
+      "id": "stage_2",
+      "title": "Practice",
+      "internal_role": "pretrip",
+      "open_at": "2026-11-21",
+      "close_at": "2026-11-27T23:59:00+03:00",
+      "tasks": [
+        {
+          "id": "practice_1",
+          "number": 1,
+          "text": "Оставь свой любимый мем в комментариях к любому видео в TikTok СДС (https://www.tiktok.com/@sdsleep_tok?_r=1&_t=ZS-9BXoLHqD83q) и отправь скриншот в бот.",
+          "points": 1,
+          "response_type": "photo",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "practice_2",
+          "number": 2,
+          "text": "Сфотографируйся так, чтобы вы с другими участниками изобразили телом буквы «С», «Д», «С» и получилось слово «СДС». Отправь фото в бот.",
+          "points": 2,
+          "response_type": "photo",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "practice_3",
+          "number": 3,
+          "text": "Нарисуй символ одной из сфер СДС (Партнёрка / ER / PR), не используя её название. Отправь рисунок в бот.",
+          "points": 3,
+          "response_type": "photo",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "practice_4",
+          "number": 4,
+          "text": "Собери коллаж или мудборд с вайбом и эстетикой организатора мероприятий и отправь его в бот.",
+          "points": 4,
+          "response_type": "photo",
+          "manual_review": true,
+          "max_submissions": 1
+        }
+      ],
+      "display_title": "Разведка"
+    },
+    {
+      "id": "stage_3",
+      "title": "Theory",
+      "internal_role": "pretrip",
+      "open_at": "2026-11-21",
+      "close_at": "2026-11-27T23:59:00+03:00",
+      "tasks": [
+        {
+          "id": "theory_1",
+          "number": 1,
+          "text": "Ниже приведены 4 факта об СДС, один из которых ложный. Определи его и отправь в бот номер ложного факта.\n\n1. Слона из стола и картона, которого использовала пара на Большом МиМе, на аукционе Летней Ярмарки купили за 4500р.\n2. Однажды Малый совет развозил коньки после Ice-Вышки по всему Петербургу.\n3. Как промо для 444 СДС всерьёз устроили беговой клуб, чтобы сначала побегать под андерграунд рэп, а потом потусоваться в кофейне под техно.\n4. На репетиции МиМа у участников сломался трон, поэтому до конца прогона его играл орг из МС на четвереньках.",
+          "points": 1,
+          "response_type": "text",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "theory_2",
+          "number": 2,
+          "text": "Расположи события СДС в хронологическом порядке.",
+          "points": 2,
+          "response_type": "text",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "theory_3",
+          "number": 3,
+          "text": "Внимательно изучи фотографии и альбомы с Ice-Вышки 2025/26 учебного года, найди фотографию, на которой трое организаторов стоят отдельно от всех, и пришли её в бот.",
+          "points": 3,
+          "response_type": "photo",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "theory_4",
+          "number": 4,
+          "text": "В каком году с 2022 по 2026 количество членов Малого совета было наибольшим (не считая руководителей)?",
+          "points": 4,
+          "response_type": "text",
+          "manual_review": true,
+          "max_submissions": 1
+        }
+      ],
+      "display_title": "Сборка"
+    },
+    {
+      "id": "stage_4",
+      "title": "Action",
+      "internal_role": "awakening",
+      "open_at": "2026-11-28T10:00:00+03:00",
+      "close_at": "2026-11-29T09:00:00+03:00",
+      "tasks": [
+        {
+          "id": "action_1",
+          "number": 1,
+          "text": "Придумай и напиши названия трёх предметов, которые ты взял(а) бы в экспедицию на поиски Атлантиды. Отправь ответ в бот.",
+          "points": 1,
+          "response_type": "text",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "action_2",
+          "number": 2,
+          "text": "Реши загадку: «Он подарил человечеству легенду о месте, которого сам никогда не видел. С тех пор затонувший город ищут две тысячи лет». Напиши, кто создал этот миф и о чём он.",
+          "points": 2,
+          "response_type": "text",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "action_3",
+          "number": 3,
+          "text": "Сфотографируйся с одним участником из каждой команды и отправь все снимки в бот.",
+          "points": 3,
+          "response_type": "multiple_photos",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "action_4",
+          "number": 4,
+          "text": "Запиши видео, в котором пять человек изображают одну подводную лодку, и отправь его в бот.",
+          "points": 4,
+          "response_type": "video",
+          "manual_review": true,
+          "max_submissions": 1
+        },
+        {
+          "id": "action_5",
+          "number": 5,
+          "text": "Собери 10 цитат, написанных на толстовках организаторов, и отправь подборку в бот.",
+          "points": 5,
+          "response_type": "text_or_multiple_photos",
+          "manual_review": true,
+          "max_submissions": 1
+        }
+      ],
+      "display_title": "Погружение"
+    }
+  ]
+}

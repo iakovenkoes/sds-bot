@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+*.pyc
+*.db
+*.sqlite3
+*.log
+*.zip
+secret*
+
+.env
+.venv/
+
+/data/attendee_whitelist.json
+/data/initial_admin_ids.json
