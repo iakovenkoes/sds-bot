@@ -1,9 +1,13 @@
 """Entrypoint: one bot instance with PostgreSQL and a durable intro queue."""
 import asyncio
 import logging
+import os
+from secrets import compare_digest
 from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Update
+from fastapi import FastAPI, HTTPException, Request
 from sqlalchemy import select
 
 from app.config import load_settings
@@ -59,6 +63,51 @@ async def main():
         except asyncio.CancelledError:
             pass
         await db.close()
+
+
+app = FastAPI()
+_webhook_lock = asyncio.Lock()
+_webhook_runtime: tuple[Bot, Dispatcher] | None = None
+
+
+async def get_webhook_runtime() -> tuple[Bot, Dispatcher]:
+    global _webhook_runtime
+
+    async with _webhook_lock:
+        if _webhook_runtime is None:
+            cfg = load_settings()
+            db = Database(cfg.database_url)
+            try:
+                await db.init()
+                handlers.configure(db, cfg)
+                dispatcher = Dispatcher(storage=MemoryStorage())
+                dispatcher.include_router(handlers.router)
+                bot = Bot(cfg.bot_token.get_secret_value())
+            except BaseException:
+                await db.close()
+                raise
+
+            _webhook_runtime = bot, dispatcher
+
+        return _webhook_runtime
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    expected = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+    received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not expected or not compare_digest(received.encode(), expected.encode()):
+        raise HTTPException(status_code=403)
+
+    bot, dispatcher = await get_webhook_runtime()
+    update = Update.model_validate(await request.json(), context={"bot": bot})
+    await dispatcher.feed_update(bot, update)
+    return {"ok": True}
 
 
 if __name__=='__main__':
