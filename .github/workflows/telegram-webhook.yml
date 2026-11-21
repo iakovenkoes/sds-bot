@@ -1,0 +1,26 @@
+name: Connect Telegram webhook
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  connect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Register webhook
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+        run: |
+          if [[ -z "$BOT_TOKEN" || -z "$WEBHOOK_SECRET" ]]; then
+            echo "Add both repository secrets before running this workflow."
+            exit 1
+          fi
+
+          curl --silent --show-error --fail-with-body --max-time 25 \
+            --request POST \
+            --data-urlencode 'url=https://sds-bot-eta.vercel.app/telegram/webhook' \
+            --data-urlencode "secret_token=$WEBHOOK_SECRET" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook"
