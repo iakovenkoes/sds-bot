@@ -127,3 +127,42 @@ class UrgentBroadcast(Base):
     sent_count: Mapped[int] = mapped_column(Integer, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ReviewDelivery(Base):
+    """One review card per submission; makes resync safe for an existing database."""
+    __tablename__ = 'review_deliveries'
+    submission_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('submissions.id'), primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    message_id: Mapped[int] = mapped_column(BigInteger)
+    thread_id: Mapped[int] = mapped_column(BigInteger)
+    delivered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CodeWindow(Base):
+    """Admin controlled short acceptance window; persistent over bot restarts."""
+    __tablename__ = 'code_windows'
+    day: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(12), primary_key=True)  # lecture / mk
+    closes_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    opened_by: Mapped[int | None] = mapped_column(BigInteger)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class CodeAttempt(Base):
+    """Per-user rate limiting across bot restarts."""
+    __tablename__ = 'code_attempts'
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('users.id'), primary_key=True)
+    day: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(12), primary_key=True)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TicketRedemption(Base):
+    """Unique code and per-user/day guarantee, enforced by PostgreSQL."""
+    __tablename__ = 'ticket_redemptions'
+    __table_args__ = (UniqueConstraint('user_id', 'day', name='uq_ticket_user_day'),)
+    code: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('users.id'), nullable=False)
+    day: Mapped[int] = mapped_column(Integer, nullable=False)
+    redeemed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

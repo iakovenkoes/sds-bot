@@ -1,6 +1,10 @@
 """Telegram handlers: stage 1 participant core, submissions, and basic admin export."""
 import asyncio
 import io
+import json
+import re
+from datetime import datetime, timezone
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 import logging
 from datetime import timedelta
 from decimal import Decimal
@@ -15,8 +19,9 @@ import xlsxwriter
 from pathlib import Path
 
 from app.db import upsert_user
+from app.scheduler import queue_late_join_story, EVENTS, event_time
 from app.media import classify_task_part, forward_task_part
-from app.models import User, UserRole, Registration, PointEntry, Submission, SubmissionPart, PlannedMessage, BotSetting, SupportCase, SupportMirror, TripAttendee, UrgentBroadcast, utcnow
+from app.models import User, UserRole, Registration, PointEntry, Submission, SubmissionPart, PlannedMessage, BotSetting, SupportCase, SupportMirror, TripAttendee, UrgentBroadcast, ReviewDelivery, CodeWindow, CodeAttempt, TicketRedemption, utcnow
 from app.messages import WELCOME, REGISTRATION, SUBMISSION_RECEIVED, STYLES
 from app import keyboards as kb
 from app import rules
@@ -42,8 +47,11 @@ class Input(StatesGroup):
     admin_find = State()
     admin_adjust = State()
     question = State()
+    urgent_audience = State()
     urgent_content = State()
     urgent_confirm = State()
+    code_word = State()
+    ticket_code = State()
 
 
 # Configured by main.py when the bot starts.
@@ -51,11 +59,15 @@ DB = None
 SETTINGS = None
 # Local, per-superadmin override. This is intentionally not persisted across Docker restarts.
 PARTICIPANT_VIEW = set()
+# Explicitly enabled by /preview; NEVER active automatically on the live server.
+PREVIEW_USERS = set()
 
 
 def configure(db, settings):
     global DB, SETTINGS
     DB, SETTINGS = db, settings
+    PREVIEW_USERS.clear()
+    PARTICIPANT_VIEW.clear()
 
 
 async def _ensure(message: Message):
@@ -76,9 +88,20 @@ async def is_admin(telegram_id: int) -> bool:
     return await role(telegram_id, 'admin')
 
 
+async def can_support(telegram_id: int) -> bool:
+    # Admins may answer support conversations without a separate support role.
+    return await is_admin(telegram_id) or await role(telegram_id, 'support')
+
+
+async def can_review(telegram_id: int) -> bool:
+    # A reviewer is not an admin; the superadmin can intervene.
+    return await role(telegram_id, 'reviewer')
+
+
+
 async def has_hero_access(user_id: int) -> bool:
     """Allowlisted trip person, bound once to Telegram ID; or isolated Super Admin preview."""
-    if preview_enabled(user_id):
+    if user_id == SETTINGS.super_admin_id or preview_enabled(user_id):
         return True
     async with DB.sessions() as session:
         user = await session.get(User, user_id)
@@ -106,12 +129,13 @@ async def registered(user_id: int, day: int) -> bool:
 
 
 def preview_enabled(user_id: int) -> bool:
-    """Development preview is restricted to the configured Super Admin only."""
-    return bool(SETTINGS and SETTINGS.test_mode and user_id == SETTINGS.super_admin_id and user_id not in PARTICIPANT_VIEW)
+    """On-demand preview only for the superadmin (works on production too)."""
+    return bool(SETTINGS and user_id == SETTINGS.super_admin_id and user_id in PREVIEW_USERS and user_id not in PARTICIPANT_VIEW)
 
 
 def can_register_for(user_id: int, day: int) -> bool:
-    # Preview permits pre-launch registration in the LOCAL database only.
+    # Preview only bypasses calendar restrictions for the superadmin. On a live
+    # database, any resulting changes are REAL; use a test account for simulations.
     return rules.can_register(day) or (preview_enabled(user_id) and rules.current_msk() < rules.FIRST_DATE)
 
 
@@ -121,7 +145,7 @@ def stage_open_for(user_id: int, stage: str) -> bool:
 
 async def display_menu(message: Message, actor=None):
     actor = actor or message.from_user
-    await formatted_answer(message,'Главное меню ATLANTIS', reply_markup=kb.menu(show_hero=await has_hero_access(actor.id)))
+    await formatted_answer(message,'Главное меню ATLANTIS', reply_markup=kb.menu())
 
 
 @router.message(CommandStart())
@@ -135,6 +159,7 @@ async def start(message: Message, state: FSMContext):
             # Background worker resumes this after restarts; unique (user, kind).
             s.add(PlannedMessage(user_id=user.id, kind='intro', due_at=utcnow()+timedelta(seconds=11)))
             user.intro_queued = True
+            await queue_late_join_story(s, user.id)
         await s.commit()
     if first:
         await formatted_answer(message,WELCOME)
@@ -163,6 +188,7 @@ async def participant_mode(message: Message, state: FSMContext):
     if message.chat.type != 'private' or message.from_user.id != SETTINGS.super_admin_id:
         return
     PARTICIPANT_VIEW.add(message.from_user.id)
+    PREVIEW_USERS.discard(message.from_user.id)
     await state.clear()
     await formatted_answer(message,'Режим участника. Сейчас действуют обычные ограничения по датам. Чтобы снова увидеть предпросмотр — /preview; админ-панель — /admin.')
     await display_menu(message)
@@ -172,10 +198,8 @@ async def participant_mode(message: Message, state: FSMContext):
 async def preview_mode(message: Message, state: FSMContext):
     if message.chat.type != 'private' or message.from_user.id != SETTINGS.super_admin_id:
         return
-    if not SETTINGS.test_mode:
-        await formatted_answer(message,'Предпросмотр выключен в настройках. Он доступен только для локального тестирования.')
-        return
     PARTICIPANT_VIEW.discard(message.from_user.id)
+    PREVIEW_USERS.add(message.from_user.id)
     await state.clear()
     await formatted_answer(message,'Предпросмотр включён: ты можешь открыть разделы заранее. Для панели администратора — /admin.')
     await display_menu(message)
@@ -369,6 +393,27 @@ async def cancel_action(message: Message, state: FSMContext):
 
 
 
+@router.message(Command('schedule_status'))
+async def schedule_status(message: Message):
+    """Read-only operational view: only the designated super-administrator."""
+    if message.chat.type != 'private' or message.from_user.id != SETTINGS.super_admin_id:
+        return
+    lines = ['Планировщик Майи. Московское время.']
+    async with DB.sessions() as s:
+        for event in EVENTS:
+            key = 'auto_v010_' + event['id']
+            marker = await s.get(BotSetting, key)
+            kind = 'auto:' + event['id']
+            queued = await s.scalar(select(func.count(PlannedMessage.id)).where(PlannedMessage.kind == kind))
+            delivered = await s.scalar(select(func.count(PlannedMessage.id)).where(
+                PlannedMessage.kind == kind, PlannedMessage.delivered_at.is_not(None)))
+            dt = event_time(event).astimezone(rules.MOSCOW)
+            status = marker.value if marker else 'ожидает времени'
+            lines.append(f"{dt:%d.%m %H:%M} — {event['id']}: {status}; отправлено {delivered}/{queued}")
+    lines.append('Команда показывает очередь и доставки, но не гарантирует доставку будущих сообщений.')
+    await formatted_answer(message, '\n'.join(lines))
+
+
 @router.message(Command('admin'))
 async def admin(message: Message, state: FSMContext):
     if message.chat.type != 'private' or not await is_admin(message.from_user.id):
@@ -376,6 +421,7 @@ async def admin(message: Message, state: FSMContext):
     await state.clear()
     if message.from_user.id == SETTINGS.super_admin_id:
         PARTICIPANT_VIEW.discard(message.from_user.id)
+        PREVIEW_USERS.discard(message.from_user.id)
     await formatted_answer(message,
         'Панель администратора: выгрузка регистраций, поиск участников, корректировка баллов и срочная рассылка. '
         'Срочная рассылка доступна всем назначенным администраторам, отправка — после подтверждения. ' +
@@ -404,6 +450,25 @@ async def name_receive(message: Message, state: FSMContext):
         await change_registration(message, message.from_user, int(day), op)
     elif action.startswith('task:'):
         await open_task(message, message.from_user, state, action[5:])
+    elif action.startswith('code:'):
+        _, day_s, kind = action.split(':')
+        day = int(day_s)
+        async with DB.sessions() as session:
+            open_now = await _window_is_open(session, day, kind)
+        if open_now and (kind != 'lecture' or await registered(message.from_user.id, day)):
+            await state.set_state(Input.code_word)
+            await state.update_data(day=day, kind=kind)
+            await formatted_answer(message, 'Введите кодовое слово, которое назвал спикер. Для отмены — /cancel.')
+        else:
+            await formatted_answer(message, 'Сейчас ввод кодового слова недоступен.')
+    elif action.startswith('ticket:'):
+        day = int(action.split(':')[1])
+        if rules.visible_lecture_button(day) and await registered(message.from_user.id, day):
+            await state.set_state(Input.ticket_code)
+            await state.update_data(day=day)
+            await formatted_answer(message, 'Введите уникальный код счастливого билета. Для отмены — /cancel.')
+        else:
+            await formatted_answer(message, 'Сейчас счастливые билеты недоступны.')
     else:
         await display_menu(message)
 
@@ -460,7 +525,7 @@ async def registration_call(call: CallbackQuery, state: FSMContext):
 async def show_hero(message: Message, actor, state: FSMContext) -> None:
     await state.clear()
     if not await has_hero_access(actor.id):
-        await formatted_answer(message,'«Путь героя» доступен только участникам выезда. Укажи ФИО в профиле; если ты в списке и раздел не появился, напиши в «Вопрос Майе».')
+        await formatted_answer(message,'«Путь героя» — задания для участников выезда 28–29 ноября.\n\nЧтобы открыть задания и отправлять ответы, необходимо быть в списке участников выезда и указать своё ФИО в разделе «Мой профиль» → «Изменить ФИО».\n\nЕсли вы едете на выезд, но после ввода ФИО задания недоступны, напишите в «Вопрос Майе».', reply_markup=kb.make([[('Мой профиль', 'profile')], [('Лекции и мастер-классы', 'lectures')], [('Главное меню', 'menu')]]))
         return
     now = rules.current_msk()
     if now >= rules.ACTION_END:
@@ -617,51 +682,299 @@ async def submit(call:CallbackQuery,state:FSMContext,bot:Bot):
         await s.commit()
     await state.clear()
     await formatted_answer(call.message,SUBMISSION_RECEIVED)
-    # If the organizer chat is not configured yet, the DB submission remains pending.
-    if SETTINGS.review_chat_id:
+    # Keep submitted work pending even before the group/topics are configured.
+    try:
+        await deliver_review_submission(bot, sub_id)
+    except Exception:
+        log.exception('Failed to mirror submission %s; /review_sync can retry', sub_id)
+
+
+# Review setup is stored in PostgreSQL, not in a developer's local .env.
+REVIEW_STAGES = {'Research': 'Архив', 'Practice': 'Разведка',
+                 'Theory': 'Сборка', 'Action': 'Погружение'}
+REVIEW_ALIASES = {
+    'архив': 'Research', 'archive': 'Research', 'research': 'Research',
+    'разведка': 'Practice', 'recon': 'Practice', 'practice': 'Practice',
+    'сборка': 'Theory', 'assembly': 'Theory', 'theory': 'Theory',
+    'погружение': 'Action', 'action': 'Action', 'dive': 'Action',
+}
+
+
+async def review_destination(stage: str) -> tuple[int, int] | None:
+    async with DB.sessions() as s:
+        group = await s.get(BotSetting, 'review_chat_id')
+        topic = await s.get(BotSetting, 'review_topic_' + stage)
+    chat_id = int(group.value) if group else SETTINGS.review_chat_id
+    if not chat_id or not topic:
+        return None
+    return chat_id, int(topic.value)
+
+
+async def _review_group_id() -> int:
+    async with DB.sessions() as s:
+        row = await s.get(BotSetting, 'review_chat_id')
+    return int(row.value) if row else SETTINGS.review_chat_id
+
+
+async def deliver_review_submission(bot: Bot, submission_id: int) -> bool:
+    """Send one pending work to the appropriate forum topic. Safe to retry."""
+    async with DB.sessions() as s:
+        sub = await s.get(Submission, submission_id)
+        if not sub or sub.status != 'pending' or await s.get(ReviewDelivery, submission_id):
+            return False
+        task = TASKS.get(sub.task_id)
+        if not task:
+            log.error('Unknown task %s in submission %s', sub.task_id, submission_id)
+            return False
+        dest = await review_destination(task['stage'])
+        if not dest:
+            return False
+        chat_id, thread_id = dest
+        participant = await s.get(User, sub.user_id)
+        parts = (await s.scalars(select(SubmissionPart).where(
+            SubmissionPart.submission_id == sub.id).order_by(SubmissionPart.id))).all()
+        identity = ('@' + participant.username) if participant and participant.username else 'нет username'
+        full_name = participant.full_name if participant and participant.full_name else 'ФИО не указано'
+        card = (f'Новая работа №{sub.id}\nБлок: {REVIEW_STAGES[task["stage"]]}\n'
+                f'Задание: {task["number"]}\nУчастник: {full_name}\n'
+                f'Telegram: {identity}\nTelegram ID: {sub.user_id}\n'
+                f'Баллы: {rules.points_label(task["points"])}\n'
+                'Материалы ответа ниже. Принять или отклонить можно один раз.')
+        # A row lock serializes two concurrent syncs and a live participant submission.
+        await s.execute(select(Submission).where(Submission.id == sub.id).with_for_update())
+        if await s.get(ReviewDelivery, submission_id):
+            return False
+        root = await bot.send_message(chat_id, card, message_thread_id=thread_id,
+                                      reply_markup=kb.make([[
+                                          ('Принять', f'review:accept:{sub.id}'),
+                                          ('Отклонить', f'review:reject:{sub.id}')]]))
+        # Record immediately so a delivery can never be followed by a second card
+        # after a later attachment failure (retry attachments requires manual care).
+        s.add(ReviewDelivery(submission_id=sub.id, chat_id=chat_id,
+                             message_id=root.message_id, thread_id=thread_id))
+        await s.commit()
+    # Telegram file IDs are reusable by this bot; keep originals in PostgreSQL.
+    for part in parts:
         try:
-            await bot.send_message(SETTINGS.review_chat_id,f'Работа №{sub_id}\nУчастник ID: {call.from_user.id}\nЗадание: {task_id}\nБаллы: {t["points"]}',
-                reply_markup=kb.make([[('Принять',f'review:accept:{sub_id}'),('Отклонить',f'review:reject:{sub_id}')]]))
-            for kind, text, file_id in copies:
-                await forward_task_part(bot, SETTINGS.review_chat_id, kind, text, file_id)
+            await forward_task_part(bot, chat_id, part.content_type, part.text, part.file_id,
+                                    message_thread_id=thread_id, reply_to_message_id=root.message_id)
         except Exception:
-            log.exception('Could not forward submission %s to review group',sub_id)
+            log.exception('Attachment %s could not be delivered for submission %s',
+                          part.id, submission_id)
+            await bot.send_message(chat_id,
+                f'ВНИМАНИЕ: не удалось переслать материал №{part.id} работы №{sub.id}. '
+                'Пока не принимайте решение; обратитесь к разработчику.',
+                message_thread_id=thread_id, reply_to_message_id=root.message_id)
+    return True
+
+
+@router.message(Command('bind_review'))
+async def bind_review(message: Message):
+    if message.chat.type != 'supergroup' or not message.from_user or message.from_user.id != SETTINGS.super_admin_id:
+        return
+    async with DB.sessions() as s:
+        setting = await s.get(BotSetting, 'review_chat_id')
+        if setting:
+            setting.value = str(message.chat.id)
+        else:
+            s.add(BotSetting(key='review_chat_id', value=str(message.chat.id)))
+        await s.commit()
+    await message.answer('Группа проверки подключена. Открой каждую из четырёх тем и отправь там '
+                         '/bind_stage архив, /bind_stage разведка, /bind_stage сборка или '
+                         '/bind_stage погружение. Затем отправь /review_sync в General.')
+
+
+@router.message(Command('bind_stage'))
+async def bind_review_stage(message: Message):
+    if message.chat.type != 'supergroup' or not message.from_user or message.from_user.id != SETTINGS.super_admin_id:
+        return
+    if message.chat.id != await _review_group_id():
+        await message.answer('Сначала привяжи эту группу командой /bind_review в General.')
+        return
+    stage = REVIEW_ALIASES.get((message.text or '').split(maxsplit=1)[-1].strip().lower())
+    if not stage or (message.text or '').count(' ') == 0:
+        await message.answer('Формат: /bind_stage архив (либо разведка, сборка, погружение).')
+        return
+    thread_id = message.message_thread_id
+    if not thread_id or thread_id == 1:
+        await message.answer('Открой отдельную тему нужного блока, а не General.')
+        return
+    async with DB.sessions() as s:
+        row = await s.get(BotSetting, 'review_topic_' + stage)
+        if row:
+            row.value = str(thread_id)
+        else:
+            s.add(BotSetting(key='review_topic_' + stage, value=str(thread_id)))
+        await s.commit()
+    await message.answer(f'Тема «{REVIEW_STAGES[stage]}» подключена. ID темы: {thread_id}.')
+
+
+@router.message(Command('review_status'))
+async def review_status(message: Message):
+    if message.from_user.id != SETTINGS.super_admin_id:
+        return
+    async with DB.sessions() as s:
+        settings = {row.key: row.value for row in (await s.scalars(
+            select(BotSetting).where(BotSetting.key.like('review_%')))).all()}
+        undelivered = (await s.scalars(select(Submission).where(Submission.status == 'pending',
+            ~Submission.id.in_(select(ReviewDelivery.submission_id))))).all()
+    group = settings.get('review_chat_id') or str(SETTINGS.review_chat_id or 'не подключена')
+    detail = '\n'.join(f'{name}: ' + ('подключена' if settings.get('review_topic_' + stage) else 'не подключена')
+                        for stage, name in REVIEW_STAGES.items())
+    await message.answer(f'Группа: {group}\n{detail}\nОжидают пересылки: {len(undelivered)}')
+
+
+@router.message(Command('review_sync'))
+async def review_sync(message: Message, bot: Bot):
+    if message.chat.type != 'supergroup' or message.from_user.id != SETTINGS.super_admin_id:
+        return
+    if message.chat.id != await _review_group_id():
+        return
+    async with DB.sessions() as s:
+        pending = (await s.scalars(select(Submission.id).where(
+            Submission.status == 'pending',
+            ~Submission.id.in_(select(ReviewDelivery.submission_id))).order_by(Submission.id).limit(100))).all()
+    count = 0
+    for sid in pending:
+        try:
+            count += bool(await deliver_review_submission(bot, sid))
+        except Exception:
+            log.exception('Failed to sync submission %s', sid)
+    await message.answer(f'Передано работ: {count}. Если часть тем не привязана, '
+                         'работы останутся в очереди. /review_status покажет состояние.')
+
+
+@router.message(Command('addreviewer'))
+async def add_reviewer(message: Message):
+    if message.chat.type != 'private' or message.from_user.id != SETTINGS.super_admin_id:
+        return
+    args = (message.text or '').split()
+    if len(args) != 2 or not args[1].isdigit() or int(args[1]) <= 0:
+        await message.answer('Формат: /addreviewer 123456789. Проверяющий должен сначала отправить боту /start.')
+        return
+    uid = int(args[1])
+    async with DB.sessions() as s:
+        user = await s.get(User, uid)
+        if not user:
+            await message.answer('Пользователь ещё не зарегистрирован. Пусть отправит Майе /start.')
+            return
+        if await s.get(UserRole, (uid, 'reviewer')):
+            await message.answer('Этот пользователь уже проверяющий.')
+            return
+        s.add(UserRole(user_id=uid, role='reviewer'))
+        await s.commit()
+    await message.answer(f'Проверяющий назначен: {uid}. Доступ к /admin не предоставлен.')
+
+
+@router.message(Command('removereviewer'))
+async def remove_reviewer(message: Message):
+    if message.chat.type != 'private' or message.from_user.id != SETTINGS.super_admin_id:
+        return
+    args = (message.text or '').split()
+    if len(args) != 2 or not args[1].isdigit():
+        await message.answer('Формат: /removereviewer 123456789')
+        return
+    uid = int(args[1])
+    async with DB.sessions() as s:
+        deleted = await s.execute(delete(UserRole).where(UserRole.user_id == uid, UserRole.role == 'reviewer'))
+        await s.commit()
+    await message.answer('Роль проверяющего снята.' if deleted.rowcount else 'Проверяющий с таким ID не найден.')
+
+
+@router.message(Command('reviewers'))
+async def list_reviewers(message: Message):
+    if message.chat.type != 'private' or message.from_user.id != SETTINGS.super_admin_id:
+        return
+    async with DB.sessions() as s:
+        rows = (await s.scalars(select(UserRole.user_id).where(
+            UserRole.role == 'reviewer').order_by(UserRole.user_id))).all()
+    await message.answer('Проверяющие (не администраторы):\n' +
+                         ('\n'.join(map(str, rows)) if rows else 'пока нет'))
 
 
 @router.callback_query(F.data.startswith('review:'))
-async def review(call:CallbackQuery):
-    if not SETTINGS.review_chat_id or call.message.chat.id != SETTINGS.review_chat_id or not await role(call.from_user.id,'reviewer'):
-        await call.answer('Нет доступа',show_alert=True)
+async def review(call: CallbackQuery):
+    if call.message.chat.id != await _review_group_id() or not await can_review(call.from_user.id):
+        await call.answer('Нет доступа к проверке', show_alert=True)
         return
     try:
-        _,action,sid=call.data.split(':')
-        sub_id=int(sid)
-    except (ValueError,IndexError):
+        _, action, sid = call.data.split(':')
+        sub_id = int(sid)
+    except (ValueError, IndexError):
+        await call.answer('Неверная команда', show_alert=True)
         return
-    if action not in ('accept','reject'):
+    if action not in ('accept', 'reject'):
+        await call.answer('Неверное действие', show_alert=True)
         return
     async with DB.sessions() as s:
-        sub=await s.scalar(select(Submission).where(Submission.id==sub_id).with_for_update())
-        if not sub or sub.status!='pending':
-            await call.answer('Работа уже обработана',show_alert=True)
+        sub = await s.scalar(select(Submission).where(Submission.id == sub_id).with_for_update())
+        delivery = await s.get(ReviewDelivery, sub_id)
+        if not sub or not delivery or delivery.chat_id != call.message.chat.id or delivery.message_id != call.message.message_id:
+            await call.answer('Карточка работы не найдена', show_alert=True)
+            return
+        if sub.status != 'pending':
+            await call.answer('Работа уже обработана', show_alert=True)
+            return
+        t = TASKS.get(sub.task_id)
+        if not t:
+            await call.answer('Задание не найдено', show_alert=True)
             return
         if action == 'accept' and not preview_enabled(sub.user_id):
-            submitter = await s.get(User, sub.user_id)
-            attendee = (await s.get(TripAttendee, rules.normalize_whitelist_name(submitter.full_name))
-                        if submitter and submitter.full_name else None)
+            participant = await s.get(User, sub.user_id)
+            attendee = await s.get(TripAttendee, rules.normalize_whitelist_name(participant.full_name)) \
+                       if participant and participant.full_name else None
             if not attendee or attendee.telegram_id != sub.user_id:
-                await call.answer('Нет подтверждённого допуска к «Пути героя»', show_alert=True)
+                await call.answer('Нет подтверждённого допуска', show_alert=True)
                 return
-        sub.status='accepted'if action=='accept'else 'rejected'
-        sub.reviewed_by=call.from_user.id
-        sub.reviewed_at=utcnow()
-        if action=='accept':
-            value=Decimal(str(TASKS[sub.task_id]['points']))
-            s.add(PointEntry(user_id=sub.user_id,delta=value,source_key=f'task:{sub.user_id}:{sub.task_id}',actor_id=call.from_user.id))
+        sub.status = 'accepted' if action == 'accept' else 'rejected'
+        sub.reviewed_by = call.from_user.id
+        sub.reviewed_at = utcnow()
+        if action == 'accept':
+            s.add(PointEntry(user_id=sub.user_id, delta=Decimal(str(t['points'])),
+                             source_key=f'task:{sub.user_id}:{sub.task_id}',
+                             actor_id=call.from_user.id))
         await s.commit()
     await call.answer('Решение сохранено')
     await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.reply(f'Работа №{sub_id}: {"Принято"if action=="accept"else "Отклонено"} · {call.from_user.full_name}')
+    await call.message.reply(f'Работа №{sub_id}: '
+                             f'{"Принято" if action == "accept" else "Отклонено"}. '
+                             f'Проверил: {call.from_user.full_name}. '
+                             f'Начислено: {rules.points_label(t["points"] if action == "accept" else 0)}.')
+
+
+@router.message(Command('review_override'))
+async def review_override(message: Message):
+    """Only the superadmin may correct a completed decision; compensating ledger entry."""
+    if message.chat.type != 'private' or message.from_user.id != SETTINGS.super_admin_id:
+        return
+    args = (message.text or '').split()
+    if len(args) != 3 or not args[1].isdigit() or args[2].lower() not in ('accept', 'reject'):
+        await message.answer('Формат: /review_override НОМЕР_РАБОТЫ accept или reject')
+        return
+    sub_id, wanted = int(args[1]), ('accepted' if args[2].lower() == 'accept' else 'rejected')
+    async with DB.sessions() as s:
+        sub = await s.scalar(select(Submission).where(Submission.id == sub_id).with_for_update())
+        if not sub or sub.status not in ('accepted', 'rejected'):
+            await message.answer('Работа не найдена или ещё не проверена.')
+            return
+        if sub.status == wanted:
+            await message.answer('У этой работы уже такой результат. Баллы не менялись.')
+            return
+        task = TASKS.get(sub.task_id)
+        if not task:
+            await message.answer('Задание не найдено, изменение отменено.')
+            return
+        previous = sub.status
+        delta = Decimal(str(task['points'])) * (1 if wanted == 'accepted' else -1)
+        from uuid import uuid4
+        s.add(PointEntry(user_id=sub.user_id, delta=delta,
+                         source_key='review_override:' + uuid4().hex, actor_id=message.from_user.id))
+        sub.status = wanted
+        sub.reviewed_by = message.from_user.id
+        sub.reviewed_at = utcnow()
+        await s.commit()
+    await message.answer(f'Работа №{sub_id}: {previous} → {wanted}. '
+                         f'Корректировка баллов: {delta:+}.')
 
 
 async def show_trip(message: Message) -> None:
@@ -781,7 +1094,7 @@ async def admin_support_status(call: CallbackQuery):
 @router.callback_query(F.data.startswith('support:'))
 async def support_action(call: CallbackQuery, bot: Bot):
     gid = await get_support_chat_id()
-    if not gid or call.message.chat.id != gid or not await role(call.from_user.id, 'support'):
+    if not gid or call.message.chat.id != gid or not await can_support(call.from_user.id):
         await call.answer('Нет доступа', show_alert=True)
         return
     try:
@@ -821,7 +1134,7 @@ async def support_group_reply(message: Message, bot: Bot):
     gid = await get_support_chat_id()
     if not gid or message.chat.id != gid or not message.from_user or message.from_user.is_bot:
         return
-    if not await role(message.from_user.id, 'support'):
+    if not await can_support(message.from_user.id):
         return
     if not message.reply_to_message or not (message.text or message.photo or message.video or message.video_note or message.document):
         return
@@ -850,21 +1163,347 @@ async def support_group_reply(message: Message, bot: Bot):
     await message.reply('Ответ доставлен участнику от имени Майи.')
 
 
-@router.callback_query(F.data.startswith('code:') | F.data.startswith('ticket:'))
-async def code_or_ticket(call:CallbackQuery):
+# Operational codes are restricted to the defined dates/times in Moscow.
+CODE_FILE = Path(__file__).resolve().parent.parent / 'data' / 'code_words_tickets.json'
+CODE_DATA = json.loads(CODE_FILE.read_text(encoding='utf-8'))
+CODE_WORDS = {int(day): words for day, words in CODE_DATA['code_words'].items()}
+TICKETS = {int(day): frozenset(codes) for day, codes in CODE_DATA['tickets'].items()}
+
+
+def _kind_title(kind: str) -> str:
+    return 'лекции' if kind == 'lecture' else 'мастер-класса'
+
+
+def _code_time_valid(day: int, kind: str, now=None) -> bool:
+    if day not in CODE_WORDS or kind not in ('lecture', 'mk'):
+        return False
+    now = now or rules.current_msk()
+    return (rules.visible_lecture_button(day, now) if kind == 'lecture'
+            else rules.visible_mk_button(day, now))
+
+
+async def _window_is_open(session, day: int, kind: str, now=None) -> bool:
+    if not _code_time_valid(day, kind):
+        return False
+    row = await session.get(CodeWindow, (day, kind))
+    return bool(row and row.closes_at and row.closes_at > (now or utcnow()))
+
+
+@router.callback_query(F.data == 'admin:codes')
+async def admin_code_controls(call: CallbackQuery):
+    if call.message.chat.type != 'private' or not await is_admin(call.from_user.id):
+        await call.answer('Нет доступа', show_alert=True)
+        return
     await call.answer()
-    await formatted_answer(call.message,'Этот раздел подключим после настройки администраторских окон кодовых слов и счастливых билетов. Сейчас ввод недоступен.')
+    await _show_code_controls(call.message)
 
 
-@router.callback_query(F.data == 'admin:urgent')
-async def urgent_begin(call: CallbackQuery, state: FSMContext):
+async def _show_code_controls(message: Message):
+    rows = []
+    async with DB.sessions() as session:
+        for day in rules.LECTURE_DATES:
+            for kind in ('lecture', 'mk'):
+                window = await session.get(CodeWindow, (day, kind))
+                active = bool(window and window.closes_at and window.closes_at > utcnow()
+                              and _code_time_valid(day, kind))
+                label = f'{day}.11 {_kind_title(kind)} — ' + ('ОТКРЫТО' if active else 'закрыто')
+                rows.append([(label, f'admincode:detail:{day}:{kind}')])
+    rows.append([('Назад в админку', 'admin:codeback')])
+    await formatted_answer(message, 'Управление кодовыми словами. Каждое окно открывается на 5 минут только во время соответствующего занятия. Баллы: лекция 0,5 (по регистрации), мастер-класс 1 (для всех участников с ФИО).', reply_markup=kb.make(rows))
+
+
+@router.callback_query(F.data == 'admin:codeback')
+async def admin_code_back(call: CallbackQuery, state: FSMContext):
     if not await is_admin(call.from_user.id):
         await call.answer('Нет доступа', show_alert=True)
         return
     await call.answer()
+    await formatted_answer(
+        call.message, 'Панель администратора',
+        reply_markup=kb.admin_menu(is_super=call.from_user.id == SETTINGS.super_admin_id))
+
+
+@router.callback_query(F.data.startswith('admincode:detail:'))
+async def admin_code_detail(call: CallbackQuery):
+    if call.message.chat.type != 'private' or not await is_admin(call.from_user.id):
+        await call.answer('Нет доступа', show_alert=True)
+        return
+    try:
+        _, _, day_s, kind = call.data.split(':')
+        day = int(day_s)
+    except (ValueError, TypeError):
+        await call.answer('Неверные параметры', show_alert=True)
+        return
+    if day not in CODE_WORDS or kind not in ('lecture', 'mk'):
+        await call.answer('Неверные параметры', show_alert=True)
+        return
+    await call.answer()
+    async with DB.sessions() as session:
+        row = await session.get(CodeWindow, (day, kind))
+        closes = row.closes_at if row else None
+    status = (f'Открыто до {closes.astimezone(rules.MOSCOW):%H:%M:%S} МСК'
+              if closes and closes > utcnow() and _code_time_valid(day, kind) else 'Закрыто')
+    allowed = _code_time_valid(day, kind)
+    actions = []
+    if allowed:
+        actions.append([('Открыть на 5 минут', f'admincode:open:{day}:{kind}')])
+    actions.append([('Закрыть сейчас', f'admincode:close:{day}:{kind}')])
+    actions.append([('К окнам', 'admin:codes')])
+    await formatted_answer(call.message, f'{day} ноября · {_kind_title(kind)}\nСтатус: {status}' +
+                           ('' if allowed else '\nОткрытие возможно только в часы занятия.'),
+                           reply_markup=kb.make(actions))
+
+
+@router.callback_query(F.data.startswith('admincode:open:') | F.data.startswith('admincode:close:'))
+async def admin_code_change(call: CallbackQuery):
+    if call.message.chat.type != 'private' or not await is_admin(call.from_user.id):
+        await call.answer('Нет доступа', show_alert=True)
+        return
+    try:
+        _, action, day_s, kind = call.data.split(':')
+        day = int(day_s)
+    except (TypeError, ValueError):
+        await call.answer('Неверная команда', show_alert=True)
+        return
+    if day not in CODE_WORDS or kind not in ('lecture', 'mk') or action not in ('open', 'close'):
+        await call.answer('Неверная команда', show_alert=True)
+        return
+    if action == 'open' and not _code_time_valid(day, kind):
+        await call.answer('Сейчас это окно нельзя открыть', show_alert=True)
+        return
+    now = utcnow()
+    end = min(now + timedelta(minutes=5),
+              rules.day_end(day).astimezone(timezone.utc)) if action == 'open' else now
+    async with DB.sessions() as session:
+        await session.execute(pg_insert(CodeWindow).values(day=day, kind=kind, closes_at=end,
+            opened_by=call.from_user.id).on_conflict_do_update(
+                index_elements=['day','kind'], set_={'closes_at':end,'opened_by':call.from_user.id, 'updated_at':now}))
+        await session.commit()
+    await call.answer('Окно открыто' if action == 'open' else 'Окно закрыто')
+    await formatted_answer(call.message,
+        f'{day} ноября · {_kind_title(kind)}: ' +
+        (f'приём открыт до {end.astimezone(rules.MOSCOW):%H:%M:%S} МСК.'
+         if action == 'open' else 'приём закрыт.'),
+        reply_markup=kb.make([[('К окнам', 'admin:codes')]]))
+
+
+@router.callback_query(F.data.startswith('code:'))
+async def code_enter(call: CallbackQuery, state: FSMContext):
+    try:
+        _, day_s, kind = call.data.split(':')
+        day = int(day_s)
+    except (TypeError, ValueError):
+        await call.answer('Неверный код', show_alert=True)
+        return
+    if day not in CODE_WORDS or kind not in ('lecture', 'mk'):
+        await call.answer('Неверная команда', show_alert=True)
+        return
+    await call.answer()
+    if not _code_time_valid(day, kind):
+        await formatted_answer(call.message, 'Сейчас ввод кодового слова недоступен.')
+        return
+    if kind == 'lecture' and not await registered(call.from_user.id, day):
+        await formatted_answer(call.message, 'Для получения баллов за лекцию нужна регистрация до её начала.')
+        return
+    if await require_name(call, state, call.data):
+        return
+    async with DB.sessions() as session:
+        if not await _window_is_open(session, day, kind):
+            await formatted_answer(call.message, 'Сейчас ввод кодового слова недоступен.')
+            return
     await state.clear()
+    await state.set_state(Input.code_word)
+    await state.update_data(day=day, kind=kind)
+    await formatted_answer(call.message, 'Введите кодовое слово, которое назвал спикер. Для отмены — /cancel.')
+
+
+@router.message(Input.code_word)
+async def code_receive(message: Message, state: FSMContext):
+    data = await state.get_data()
+    day, kind = data.get('day'), data.get('kind')
+    if not isinstance(day, int) or kind not in ('lecture', 'mk'):
+        await state.clear()
+        return
+    if not message.text or message.text.startswith('/'):
+        await formatted_answer(message, 'Пришли кодовое слово текстом или отправь /cancel.')
+        return
+    if kind == 'lecture' and not await registered(message.from_user.id, day):
+        await state.clear()
+        await formatted_answer(message, 'Для получения баллов за лекцию нужна регистрация.')
+        return
+    now = utcnow()
+    async with DB.sessions() as session:
+        if not await _window_is_open(session, day, kind, now):
+            await state.clear()
+            await formatted_answer(message, 'Сейчас ввод кодового слова недоступен.')
+            return
+        # Serialize retries by user and event; throttle automated guessing.
+        await session.execute(pg_insert(CodeAttempt).values(user_id=message.from_user.id, day=day,
+            kind=kind, attempted_at=now-timedelta(seconds=4)).on_conflict_do_nothing(index_elements=['user_id','day','kind']))
+        attempt = await session.scalar(select(CodeAttempt).where(
+            CodeAttempt.user_id == message.from_user.id, CodeAttempt.day == day,
+            CodeAttempt.kind == kind).with_for_update())
+        if attempt.attempted_at and (now - attempt.attempted_at).total_seconds() < 3:
+            await formatted_answer(message, 'Подождите несколько секунд перед следующей попыткой.')
+            return
+        attempt.attempted_at = now
+        if rules.normalize_code_word(message.text) == rules.normalize_code_word(CODE_WORDS[day][kind]):
+            delta = Decimal('0.5') if kind == 'lecture' else Decimal('1.0')
+            await session.execute(pg_insert(PointEntry).values(
+                user_id=message.from_user.id, delta=delta, actor_id=None,
+                source_key=f'code:{day}:{kind}:{message.from_user.id}').on_conflict_do_nothing(index_elements=['source_key']))
+        await session.commit()
+    # Deliberately neutral: do not tell the participant if the word was correct.
+    await state.clear()
+    await formatted_answer(message, 'Ваш ответ принят!')
+
+
+@router.callback_query(F.data.startswith('ticket:'))
+async def ticket_enter(call: CallbackQuery, state: FSMContext):
+    try:
+        day = int(call.data.split(':')[1])
+    except (ValueError, IndexError):
+        await call.answer('Неверная дата', show_alert=True)
+        return
+    await call.answer()
+    if day not in TICKETS or not rules.visible_lecture_button(day):
+        await formatted_answer(call.message, 'Сейчас счастливые билеты недоступны.')
+        return
+    if not await registered(call.from_user.id, day):
+        await formatted_answer(call.message, 'Счастливые билеты доступны только зарегистрированным на лекцию.')
+        return
+    if await require_name(call, state, call.data):
+        return
+    await state.clear()
+    await state.set_state(Input.ticket_code)
+    await state.update_data(day=day)
+    await formatted_answer(call.message, 'Нашли счастливый билет? Введите его уникальный код. Для отмены — /cancel.')
+
+
+@router.message(Input.ticket_code)
+async def ticket_receive(message: Message, state: FSMContext):
+    data = await state.get_data()
+    day = data.get('day')
+    if day not in TICKETS:
+        await state.clear()
+        return
+    if not message.text or message.text.startswith('/'):
+        await formatted_answer(message, 'Введите код билета текстом или /cancel.')
+        return
+    if not rules.visible_lecture_button(day) or not await registered(message.from_user.id, day):
+        await state.clear()
+        await formatted_answer(message, 'Сейчас счастливые билеты недоступны.')
+        return
+    code = re.sub(r'\s+', '', message.text).upper().replace('–', '-').replace('—', '-')
+    if code not in TICKETS[day]:
+        await formatted_answer(message, 'Кажется, такого билета у меня нет. Проверьте символы и попробуйте ещё раз.')
+        return
+    async with DB.sessions() as session:
+        own = await session.scalar(select(TicketRedemption).where(
+            TicketRedemption.user_id == message.from_user.id,
+            TicketRedemption.day == day))
+        if own:
+            await state.clear()
+            await formatted_answer(message, 'Вы уже активировали счастливый билет на эту лекцию!')
+            return
+        result = await session.execute(pg_insert(TicketRedemption).values(
+            code=code, user_id=message.from_user.id, day=day
+        ).on_conflict_do_nothing().returning(TicketRedemption.code))
+        if result.scalar_one_or_none() is None:
+            await session.rollback()
+            await formatted_answer(message, 'Этот билет уже активирован или у вас уже есть билет на эту лекцию.')
+            return
+        await session.execute(pg_insert(PointEntry).values(
+            user_id=message.from_user.id, delta=Decimal('1.0'), actor_id=None,
+            source_key=f'ticket:{day}:{message.from_user.id}'
+        ).on_conflict_do_nothing(index_elements=['source_key']))
+        await session.commit()
+    await state.clear()
+    await formatted_answer(message, 'Поздравляю! Ваш счастливый билет активирован. Вам начислен 1 балл!')
+
+
+# Urgent broadcasts: administrator chooses the audience before composing any message.
+# Trip audience uses only explicitly linked Telegram IDs (not unverified name strings).
+URGENT_AUDIENCES = {
+    'all': 'Все пользователи бота',
+    'trip': 'Только подтверждённые участники выезда',
+    'lectures': 'Записанные хотя бы на одну лекцию',
+    'lecture23': 'Записанные на PR — 23 ноября',
+    'lecture24': 'Записанные на ER — 24 ноября',
+    'lecture25': 'Записанные на партнёрку — 25 ноября',
+}
+
+
+async def urgent_recipient_ids(audience: str) -> list[int]:
+    """Determine eligible recipients from persistent records, deduplicated and ordered."""
+    if audience not in URGENT_AUDIENCES:
+        raise ValueError('Unknown urgent broadcast audience')
+    async with DB.sessions() as session:
+        if audience == 'all':
+            stmt = select(User.id)
+        elif audience == 'trip':
+            # Only allowlist identities which were claimed by a Telegram account.
+            stmt = select(User.id).join(TripAttendee, TripAttendee.telegram_id == User.id)
+        elif audience == 'lectures':
+            stmt = select(User.id).join(Registration, Registration.user_id == User.id).where(Registration.active.is_(True))
+        else:
+            day = int(audience.removeprefix('lecture'))
+            stmt = select(User.id).join(Registration, Registration.user_id == User.id).where(
+                Registration.active.is_(True), Registration.day == day)
+        return sorted(set((await session.scalars(stmt)).all()))
+
+
+@router.callback_query(F.data == 'admin:urgent')
+async def urgent_begin(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id) or call.message.chat.type != 'private':
+        await call.answer('Нет доступа', show_alert=True)
+        return
+    await call.answer()
+    await state.clear()
+    await state.set_state(Input.urgent_audience)
+    await formatted_answer(
+        call.message,
+        'Кому отправить срочное сообщение? Выбери аудиторию:',
+        reply_markup=kb.make([
+            [('Всем пользователям', 'urgent:audience:all')],
+            [('Участникам выезда', 'urgent:audience:trip')],
+            [('Записанным на любую лекцию', 'urgent:audience:lectures')],
+            [('PR — 23 ноября', 'urgent:audience:lecture23')],
+            [('ER — 24 ноября', 'urgent:audience:lecture24')],
+            [('Партнёрка — 25 ноября', 'urgent:audience:lecture25')],
+            [('Отмена', 'urgent:cancel')],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith('urgent:audience:'))
+async def urgent_select_audience(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id) or call.message.chat.type != 'private':
+        await call.answer('Нет доступа', show_alert=True)
+        return
+    audience = call.data.removeprefix('urgent:audience:')
+    if audience not in URGENT_AUDIENCES or await state.get_state() != Input.urgent_audience.state:
+        await call.answer('Выбор устарел, начни новую рассылку.', show_alert=True)
+        return
+    recipients = await urgent_recipient_ids(audience)
+    await state.update_data(urgent_audience=audience, urgent_recipient_ids=recipients)
     await state.set_state(Input.urgent_content)
-    await formatted_answer(call.message,'Срочная рассылка всем пользователям бота. Пришли ОДНО сообщение: текст, фотографию, видео, видеокружочек или документ. Форматирование сохранится. Для отмены — /cancel.')
+    await call.answer()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await formatted_answer(
+        call.message,
+        f'Аудитория: {URGENT_AUDIENCES[audience]}.\n'
+        f'Получателей: {len(recipients)}.\n'
+        'Пришли ОДНО сообщение: текст, фото, видео, видеокружочек или документ. '
+        'Сохранятся исходные текст и форматирование. Для отмены — /cancel.\n'
+        'Важное уточнение: участники выезда учитываются после привязки ФИО к Telegram; '
+        'получатели, ещё не открывшие бот, не получат сообщение.'
+        if audience == 'trip' else
+        f'Аудитория: {URGENT_AUDIENCES[audience]}.\n'
+        f'Получателей: {len(recipients)}.\n'
+        'Пришли ОДНО сообщение: текст, фото, видео, видеокружочек или документ. '
+        'Для отмены — /cancel.'
+    )
 
 
 @router.message(Input.urgent_content)
@@ -873,16 +1512,28 @@ async def urgent_content(message: Message, state: FSMContext):
         await state.clear()
         return
     if not (message.text or message.photo or message.video or message.video_note or message.document):
-        await formatted_answer(message,'Пришли текст, фото, видео, кружочек или документ. Для отмены — /cancel.')
+        await formatted_answer(message, 'Пришли текст, фото, видео, кружочек или документ. Для отмены — /cancel.')
+        return
+    data = await state.get_data()
+    if data.get('urgent_audience') not in URGENT_AUDIENCES:
+        await state.clear()
+        await formatted_answer(message, 'Аудитория не выбрана. Открой срочную рассылку заново.')
         return
     await state.update_data(urgent_message_id=message.message_id, urgent_chat_id=message.chat.id)
     await state.set_state(Input.urgent_confirm)
-    await formatted_answer(message,'Предпросмотр рассылки:')
+    await formatted_answer(message, 'Предпросмотр рассылки:')
     await message.copy_to(message.chat.id)
-    async with DB.sessions() as s:
-        total = await s.scalar(select(func.count(User.id)))
-    await formatted_answer(message,f'Получатели: до {total} пользователей, которые запускали бота. Отправить прямо сейчас?',
-                         reply_markup=kb.make([[('Отправить всем', 'urgent:send')], [('Отмена', 'urgent:cancel')]]))
+    audience = data['urgent_audience']
+    total = len(data['urgent_recipient_ids'])
+    await formatted_answer(
+        message,
+        f'Аудитория: {URGENT_AUDIENCES[audience]}\nПолучателей: {total}\n'
+        'Это настоящая отправка. Подтвердить?',
+        reply_markup=kb.make([
+            [('Отправить выбранной аудитории', 'urgent:send')],
+            [('Отмена', 'urgent:cancel')],
+        ]),
+    )
 
 
 @router.callback_query(F.data.startswith('urgent:'))
@@ -891,42 +1542,67 @@ async def urgent_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
         await call.answer('Нет доступа', show_alert=True)
         return
     action = call.data.split(':', 1)[1]
-    if await state.get_state() != Input.urgent_confirm.state:
+    current_state = await state.get_state()
+    if action == 'cancel' and current_state in (Input.urgent_audience.state,
+                                                 Input.urgent_content.state,
+                                                 Input.urgent_confirm.state):
+        await state.clear()
+        await call.answer()
+        await call.message.edit_reply_markup(reply_markup=None)
+        await formatted_answer(call.message, 'Рассылка отменена.')
+        return
+    if action != 'send' or current_state != Input.urgent_confirm.state:
         await call.answer('Рассылка уже обработана или отменена.', show_alert=True)
         return
     data = await state.get_data()
-    await state.clear()  # Prevent a second click from sending a duplicate broadcast.
+    audience = data.get('urgent_audience')
+    if audience not in URGENT_AUDIENCES:
+        await state.clear()
+        await call.answer('Аудитория не определена.', show_alert=True)
+        return
+    ids = data.get('urgent_recipient_ids', [])
+    await state.clear()  # Prevent ordinary repeat sends.
     await call.answer()
     await call.message.edit_reply_markup(reply_markup=None)
-    if action != 'send':
-        await formatted_answer(call.message,'Рассылка отменена.')
+    if not ids:
+        await formatted_answer(call.message, 'Сейчас нет получателей в выбранной аудитории. Рассылка не отправлена.')
         return
-    # Persist the audit record and progress even if the bot is interrupted.
-    async with DB.sessions() as s:
-        record = UrgentBroadcast(actor_id=call.from_user.id, source_chat_id=data['urgent_chat_id'],
-                                 source_message_id=data['urgent_message_id'], status='sending')
-        s.add(record)
-        await s.commit()
+    async with DB.sessions() as session:
+        record = UrgentBroadcast(
+            actor_id=call.from_user.id,
+            source_chat_id=data['urgent_chat_id'],
+            source_message_id=data['urgent_message_id'],
+            status='sending',
+        )
+        session.add(record)
+        await session.flush()
         record_id = record.id
-    await formatted_answer(call.message,'Запустила срочную рассылку. Сообщение отправляется пользователям.')
-    async with DB.sessions() as s:
-        ids = (await s.scalars(select(User.id).order_by(User.id))).all()
+        # Store audience in existing settings table; no schema changes or migrations.
+        session.add(BotSetting(key=f'urgent_audience:{record_id}', value=audience))
+        await session.commit()
+    await formatted_answer(call.message, f'Запустила рассылку №{record_id} ({URGENT_AUDIENCES[audience]}).')
     ok = failed = 0
     for user_id in ids:
         try:
-            await bot.copy_message(chat_id=user_id, from_chat_id=data['urgent_chat_id'],
-                                   message_id=data['urgent_message_id'])
+            await bot.copy_message(
+                chat_id=user_id, from_chat_id=data['urgent_chat_id'],
+                message_id=data['urgent_message_id'],
+            )
             ok += 1
         except Exception:
             failed += 1
             log.warning('Urgent broadcast %s: could not deliver to user %s', record_id, user_id)
         await asyncio.sleep(0.08)
-    async with DB.sessions() as s:
-        record = await s.get(UrgentBroadcast, record_id)
+    async with DB.sessions() as session:
+        record = await session.get(UrgentBroadcast, record_id)
         record.sent_count, record.failed_count, record.status = ok, failed, 'complete'
-        await s.commit()
-    notice = f'Срочная рассылка №{record_id} завершена. Доставлено: {ok}. Не доставлено: {failed}. Отправитель: {call.from_user.id}.'
-    await formatted_answer(call.message,notice)
+        await session.commit()
+    notice = (
+        f'Срочная рассылка №{record_id} завершена. Аудитория: {URGENT_AUDIENCES[audience]}. '
+        f'Получателей: {len(ids)}. Доставлено: {ok}. Не доставлено: {failed}. '
+        f'Отправитель: {call.from_user.id}.'
+    )
+    await formatted_answer(call.message, notice)
     if call.from_user.id != SETTINGS.super_admin_id:
         try:
             await bot.send_message(SETTINGS.super_admin_id, notice)

@@ -36,11 +36,12 @@ def test_forward_circle_uses_telegram_send_video_note():
     bot.send_video_note.assert_awaited_once_with(-100100, video_note='circle_123')
 
 
-def test_allowlist_has_80_unique_full_names():
+def test_allowlist_includes_superadmin_with_unique_full_names():
     data = json.loads((Path(__file__).resolve().parents[1] / 'data' / 'attendee_whitelist.json').read_text('utf8'))
     names = data['names']
-    assert data['count'] == 80 == len(names)
-    assert len({rules.normalize_whitelist_name(x) for x in names}) == 80
+    assert data['count'] == 81 == len(names)
+    assert 'Фильченкова Анастасия Сергеевна' in names
+    assert len({rules.normalize_whitelist_name(x) for x in names}) == 81
     assert 'trip_attendees' in Base.metadata.tables
     assert TripAttendee.__tablename__ == 'trip_attendees'
 

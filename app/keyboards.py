@@ -18,12 +18,12 @@ TRIP_LABEL = 'Организационная информация'
 QUESTION_LABEL = 'Вопрос Майе'
 
 
-def menu(now=None, *, show_hero: bool = False) -> ReplyKeyboardMarkup:
+def menu(now=None, *, show_hero: bool = True) -> ReplyKeyboardMarkup:
     now = now or current_msk()
-    # Before opening: visible as navigation, but registration/submissions are gated.
+    # Show the Hero Path entry to everyone; actual stage and submission access is gated in handlers.
     # After the programme: finished sections disappear from new menus.
     labels = []
-    if now < ACTION_END and show_hero:
+    if now < ACTION_END:
         labels.append(HERO_LABEL)
     labels.append(PROFILE_LABEL)
     if now < day_end(25):
@@ -88,7 +88,8 @@ def support_actions(case_id: int) -> K:
 
 
 def admin_menu(is_super: bool = False) -> K:
-    rows = [[('Срочная рассылка', 'admin:urgent')],
+    rows = [[('Управление кодовыми словами', 'admin:codes')],
+            [('Срочная рассылка', 'admin:urgent')],
             [('Выгрузить регистрации', 'admin:export')],
             [('Найти участника', 'admin:find')]]
     if is_super:

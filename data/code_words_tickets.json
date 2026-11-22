@@ -1,0 +1,39 @@
+{
+  "code_words": {
+    "23": {
+      "lecture": "МЕДУЗА",
+      "mk": "АНАНАС"
+    },
+    "24": {
+      "lecture": "КОМЕТА",
+      "mk": "ФЛАМИНГО"
+    },
+    "25": {
+      "lecture": "НОУТБУК",
+      "mk": "КОКА-КОЛА"
+    }
+  },
+  "tickets": {
+    "23": [
+      "ATL23-5W6Y-FQS8",
+      "ATL23-FS3J-4G7P",
+      "ATL23-SJA4-QY59",
+      "ATL23-SLT6-FT35",
+      "ATL23-Y5VK-8FSL"
+    ],
+    "24": [
+      "ATL24-9XLL-W9R4",
+      "ATL24-G3V7-WAJ4",
+      "ATL24-GZXE-JFZB",
+      "ATL24-SR76-5TAY",
+      "ATL24-WPP4-B4Q9"
+    ],
+    "25": [
+      "ATL25-9SGX-YKG9",
+      "ATL25-BUTS-W234",
+      "ATL25-DM5Q-X84V",
+      "ATL25-U5D7-Y3KH",
+      "ATL25-ZR6S-NKSB"
+    ]
+  }
+}

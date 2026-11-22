@@ -46,7 +46,8 @@ def test_admin_authorization_and_urgent_confirmation():
     assert 'class UrgentBroadcast' in (ROOT/'app/models.py').read_text('utf-8')
 
 
-def test_schedule_not_enabled_without_review():
+def test_schedule_enabled_in_v010():
     import json
     data = json.loads((ROOT/'data/scheduled_messages_agreed.json').read_text('utf-8'))
-    assert data['implementation'].startswith('NOT_YET_ACTIVE')
+    assert data['implementation'].startswith('ACTIVE')
+    assert len(data['messages']) == 9

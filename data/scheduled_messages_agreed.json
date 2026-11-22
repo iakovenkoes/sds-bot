@@ -1,6 +1,6 @@
 {
   "timezone": "Europe/Moscow",
-  "implementation": "NOT_YET_ACTIVE; do not send until scheduler is implemented and validated",
+  "implementation": "ACTIVE in app/scheduler.py; persistent planned_messages queue, per-user deduplication; late joins catch up only story messages; max 30 min late deployment window",
   "messages": [
     {
       "id": "lore_1",

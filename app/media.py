@@ -16,14 +16,14 @@ def classify_task_part(message):
     return None, None, None
 
 
-async def forward_task_part(bot, chat_id, kind, text, file_id):
+async def forward_task_part(bot, chat_id, kind, text, file_id, **kwargs):
     if kind == 'text':
-        await bot.send_message(chat_id, (text or '')[:4000])
+        await bot.send_message(chat_id, (text or '')[:4000], **kwargs)
     elif kind == 'photo':
-        await bot.send_photo(chat_id, file_id, caption=(text or '')[:1024] or None)
+        await bot.send_photo(chat_id, file_id, caption=(text or '')[:1024] or None, **kwargs)
     elif kind == 'video':
-        await bot.send_video(chat_id, file_id, caption=(text or '')[:1024] or None)
+        await bot.send_video(chat_id, file_id, caption=(text or '')[:1024] or None, **kwargs)
     elif kind == 'video_note':
-        await bot.send_video_note(chat_id, video_note=file_id)
+        await bot.send_video_note(chat_id, video_note=file_id, **kwargs)
     elif kind == 'document':
-        await bot.send_document(chat_id, file_id, caption=(text or '')[:1024] or None)
+        await bot.send_document(chat_id, file_id, caption=(text or '')[:1024] or None, **kwargs)
