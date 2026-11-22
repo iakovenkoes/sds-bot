@@ -432,6 +432,44 @@ async def admin(message: Message, state: FSMContext):
 
 
 
+@router.callback_query(F.data == 'admin:stats')
+async def admin_stats(call: CallbackQuery):
+    if call.message.chat.type != 'private' or not await is_admin(call.from_user.id):
+        await call.answer('Нет доступа', show_alert=True)
+        return
+    await call.answer()
+    async with DB.sessions() as s:
+        users = await s.scalar(select(func.count(User.id))) or 0
+        named = await s.scalar(select(func.count(User.id)).where(
+            User.full_name.is_not(None), func.length(func.trim(User.full_name)) > 0)) or 0
+        registered = await s.scalar(select(func.count(func.distinct(Registration.user_id))).where(
+            Registration.active.is_(True))) or 0
+        trip_total = await s.scalar(select(func.count(TripAttendee.normalized_name))) or 0
+        trip_bound = await s.scalar(select(func.count(TripAttendee.normalized_name)).where(
+            TripAttendee.telegram_id.is_not(None))) or 0
+    await formatted_answer(call.message,
+        'Статистика бота\n\n'
+        f'Запустили бота (записаны в базе): {users}\n'
+        f'Указали ФИО: {named}\n'
+        f'Зарегистрированы хотя бы на одну лекцию: {registered}\n'
+        f'В списке выезда: {trip_total}\n'
+        f'Участники выезда, привязанные к Telegram: {trip_bound}\n\n'
+        'Статистика рассчитана по текущей базе данных.',
+        reply_markup=kb.make([[('Назад в админку', 'admin:stats:back')]]))
+
+
+
+@router.callback_query(F.data == 'admin:stats:back')
+async def admin_stats_back(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        await call.answer('Нет доступа', show_alert=True)
+        return
+    await call.answer()
+    await formatted_answer(call.message, 'Панель администратора',
+        reply_markup=kb.admin_menu(is_super=call.from_user.id == SETTINGS.super_admin_id))
+
+
+
 @router.message(Input.name)
 async def name_receive(message: Message, state: FSMContext):
     if not message.text or not rules.valid_full_name(message.text):

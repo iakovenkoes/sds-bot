@@ -1,1 +1,1 @@
-ATLANTIS v0.13 — public Hero Path entry, eligibility-gated content, 2026-11-21
+ATLANTIS v0.14 — admin stats, no originals button, whitelist 81, 2026-11-22

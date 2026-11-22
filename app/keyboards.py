@@ -69,7 +69,6 @@ def stages(now=None, preview: bool = False) -> K:
         rows.append([(stage_name('Action'), 'stage:Action')])
     elif now < ACTION_END:
         rows.append([(f'{stage_name("Action")}', 'locked:Action')])
-    rows.append([('Карточки без сжатия', 'hero:originals')])
     rows.append([('Меню', 'menu')])
     return make(rows)
 
@@ -88,7 +87,8 @@ def support_actions(case_id: int) -> K:
 
 
 def admin_menu(is_super: bool = False) -> K:
-    rows = [[('Управление кодовыми словами', 'admin:codes')],
+    rows = [[('Статистика бота', 'admin:stats')],
+            [('Управление кодовыми словами', 'admin:codes')],
             [('Срочная рассылка', 'admin:urgent')],
             [('Выгрузить регистрации', 'admin:export')],
             [('Найти участника', 'admin:find')]]
