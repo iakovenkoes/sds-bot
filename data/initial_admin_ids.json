@@ -1,0 +1,13 @@
+{
+  "role": "admin",
+  "ids": [
+    870081861,
+    724339937,
+    923817626,
+    1714103950,
+    855450289,
+    642841013,
+    971043456
+  ],
+  "note": "One-time bootstrap, revocable in DB after assigned. The super admin is from .env."
+}

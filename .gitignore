@@ -13,6 +13,3 @@ secret*
 
 .env
 .venv/
-
-/data/attendee_whitelist.json
-/data/initial_admin_ids.json

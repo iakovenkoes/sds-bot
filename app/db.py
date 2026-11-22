@@ -5,6 +5,20 @@ from app.models import Base, User, TripAttendee, UserRole, BotSetting
 from app.rules import normalize_whitelist_name
 from pathlib import Path
 import json
+import logging
+import os
+
+log = logging.getLogger('atlantis.db')
+
+
+def _read_data_json(filename: str):
+    """Read data/<filename>; return None when it is absent (e.g. Vercel
+    deploys from git and never uploads gitignored data files)."""
+    path = Path(__file__).resolve().parent.parent / 'data' / filename
+    try:
+        return json.loads(path.read_text('utf-8'))
+    except FileNotFoundError:
+        return None
 
 
 class Database:
@@ -24,8 +38,17 @@ class Database:
         Previously imported roles are never re-granted after a manual revocation.
         The v0.8.1 migration also runs against an already initialized database.
         """
-        path = Path(__file__).resolve().parent.parent / 'data' / 'initial_admin_ids.json'
-        ids = [int(x) for x in json.loads(path.read_text('utf-8'))['ids']]
+        path_data = _read_data_json('initial_admin_ids.json')
+        if path_data is not None:
+            ids = [int(x) for x in path_data['ids']]
+        else:
+            # Fallback for deployments (Vercel) where gitignored data files
+            # never reach the bundle: INITIAL_ADMIN_IDS="11111111,22222222".
+            ids = [int(x) for x in os.environ.get('INITIAL_ADMIN_IDS', '').split(',') if x.strip()]
+            if not ids:
+                log.warning('initial_admin_ids.json not found and INITIAL_ADMIN_IDS is not set; '
+                            'skipping initial admin seeding')
+                return
         async with self.sessions() as session:
             old_marker = await session.get(BotSetting, 'initial_admins_v08_imported')
             if old_marker is None:
@@ -63,9 +86,18 @@ class Database:
 
     async def seed_trip_attendees(self):
         """Non-destructive insertion. Existing Telegram bindings are preserved on updates."""
-        data = json.loads((Path(__file__).resolve().parent.parent / 'data' / 'attendee_whitelist.json').read_text('utf-8'))
+        data = _read_data_json('attendee_whitelist.json')
+        if data is None:
+            # Fallback for deployments without the gitignored whitelist file.
+            names = [x.strip() for x in os.environ.get('ATTENDEE_WHITELIST', '').split('|') if x.strip()]
+            if not names:
+                log.warning('attendee_whitelist.json not found and ATTENDEE_WHITELIST is not set; '
+                            'skipping trip attendee seeding')
+                return
+        else:
+            names = data['names']
         async with self.sessions() as session:
-            for name in data['names']:
+            for name in names:
                 norm = normalize_whitelist_name(name)
                 found = await session.get(TripAttendee, norm)
                 if not found:
