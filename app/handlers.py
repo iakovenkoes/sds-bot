@@ -21,7 +21,7 @@ from pathlib import Path
 from app.db import upsert_user
 from app.scheduler import queue_late_join_story, EVENTS, event_time
 from app.media import classify_task_part, forward_task_part
-from app.models import User, UserRole, Registration, PointEntry, Submission, SubmissionPart, PlannedMessage, BotSetting, SupportCase, SupportMirror, TripAttendee, UrgentBroadcast, ReviewDelivery, CodeWindow, CodeAttempt, TicketRedemption, utcnow
+from app.models import User, UserRole, Registration, PointEntry, Submission, SubmissionPart, PlannedMessage, BotSetting, SupportCase, SupportMirror, SupportSentReply, TripAttendee, UrgentBroadcast, ReviewDelivery, CodeWindow, CodeAttempt, TicketRedemption, utcnow
 from app.messages import WELCOME, REGISTRATION, SUBMISSION_RECEIVED, STYLES
 from app import keyboards as kb
 from app import rules
@@ -1159,26 +1159,105 @@ async def support_action(call: CallbackQuery, bot: Bot):
         await call.message.reply(f'Обращение №{case_id} закрыто.')
     else:
         prompt = await call.message.reply(
-            f'Ответь через Reply на это сообщение для обращения №{case_id}. '
-            'Майя доставит ответ участнику.'
+            f'Ответь на это сообщение командой /answer текст для обращения №{case_id}. '
+            'Обычные Reply остаются внутренней перепиской и не отправляются участнику.'
         )
         async with DB.sessions() as s:
             s.add(SupportMirror(group_message_id=prompt.message_id, case_id=case_id))
             await s.commit()
 
 
-@router.message(F.chat.type.in_({'group', 'supergroup'}))
+@router.message(Command('edit_reply'), F.chat.type.in_({'group', 'supergroup'}))
+async def edit_support_reply(message: Message, bot: Bot):
+    """Edit a previously delivered *text* answer by replying to the staff message."""
+    gid = await get_support_chat_id()
+    if not gid or message.chat.id != gid or not message.from_user or not await can_support(message.from_user.id):
+        return
+    if not message.reply_to_message:
+        await message.reply('Ответь командой /edit_reply новый текст на исходное сообщение администратора.')
+        return
+    new_text = (message.text or '').partition(' ')[2].strip()
+    if not new_text:
+        await message.reply('Напиши /edit_reply и новый правильный текст в одной строке.')
+        return
+    if len('Ответ на твой вопрос:\n\n' + new_text) > 4096:
+        await message.reply('Слишком длинный ответ: Telegram допускает не более 4096 символов.')
+        return
+    async with DB.sessions() as s:
+        sent = await s.get(SupportSentReply, message.reply_to_message.message_id)
+        if not sent:
+            await message.reply('Это старый ответ без сохранённого ID сообщения. Его нельзя изменить, но можно отправить исправление через /correct_reply.')
+            return
+        if not sent.text_editable:
+            await message.reply('Медиаответ нельзя изменить этой командой. Используй /correct_reply для текстового исправления.')
+            return
+        participant_id, participant_message_id = sent.participant_id, sent.participant_message_id
+    try:
+        await bot.edit_message_text('Ответ на твой вопрос:\n\n'+new_text,
+                                    chat_id=participant_id, message_id=participant_message_id)
+    except Exception:
+        log.exception('Failed to edit support reply')
+        await message.reply('Не удалось изменить сообщение у участника. Можно отправить исправление через /correct_reply.')
+        return
+    await message.reply('Ответ Майи в личном чате участника изменён.')
+
+
+@router.message(Command('correct_reply'), F.chat.type.in_({'group', 'supergroup'}))
+async def correct_support_reply(message: Message, bot: Bot):
+    """Send a correction for legacy replies without a saved Telegram message ID."""
+    gid = await get_support_chat_id()
+    if not gid or message.chat.id != gid or not message.from_user or not await can_support(message.from_user.id):
+        return
+    if not message.reply_to_message:
+        await message.reply('Ответь командой /correct_reply правильный текст на ошибочное сообщение администратора.')
+        return
+    correction = (message.text or '').partition(' ')[2].strip()
+    if not correction:
+        await message.reply('Напиши /correct_reply и правильный текст.')
+        return
+    if len('Исправление предыдущего ответа:\n\n' + correction) > 4096:
+        await message.reply('Слишком длинное сообщение.')
+        return
+    async with DB.sessions() as s:
+        mirror = await s.get(SupportMirror, message.reply_to_message.message_id)
+        if not mirror:
+            await message.reply('Не найдено обращение для этого сообщения. Ответь на исходное сообщение администратора.')
+            return
+        case = await s.get(SupportCase, mirror.case_id)
+        if not case:
+            await message.reply('Обращение не найдено.')
+            return
+        participant_id = case.user_id
+    try:
+        await bot.send_message(participant_id, 'Исправление предыдущего ответа:\n\n' + correction)
+    except Exception:
+        log.exception('Failed to correct support reply')
+        await message.reply('Не удалось отправить исправление участнику.')
+        return
+    await message.reply('Исправление отправлено участнику от имени Майи.')
+
+
+@router.message(Command('answer'), F.chat.type.in_({'group', 'supergroup'}))
 async def support_group_reply(message: Message, bot: Bot):
     gid = await get_support_chat_id()
     if not gid or message.chat.id != gid or not message.from_user or message.from_user.is_bot:
         return
     if not await can_support(message.from_user.id):
         return
-    if not message.reply_to_message or not (message.text or message.photo or message.video or message.video_note or message.document):
+    if not message.reply_to_message:
+        await message.reply('Чтобы отправить ответ участнику, ответь на его обращение командой /answer текст.')
+        return
+    answer_text = (message.text or '').partition(' ')[2].strip()
+    if not answer_text:
+        await message.reply('Напиши /answer и текст ответа в одном сообщении. Обычные Reply остаются внутри группы.')
+        return
+    if len('Ответ на твой вопрос:\n\n' + answer_text) > 4096:
+        await message.reply('Ответ слишком длинный для Telegram (максимум 4096 символов).')
         return
     async with DB.sessions() as s:
         mirror = await s.get(SupportMirror, message.reply_to_message.message_id)
         if not mirror:
+            await message.reply('Это сообщение не связано с обращением участника. Ответь командой /answer на исходный вопрос.')
             return
         case = await s.get(SupportCase, mirror.case_id)
         if not case or case.status != 'open':
@@ -1186,19 +1265,18 @@ async def support_group_reply(message: Message, bot: Bot):
             return
         user_id, case_id = case.user_id, case.id
     try:
-        if message.text:
-            await bot.send_message(user_id, 'Ответ на твой вопрос:\n\n'+message.text)
-        else:
-            await bot.send_message(user_id, 'Ответ на твой вопрос:')
-            await message.copy_to(chat_id=user_id)
+        delivered = await bot.send_message(user_id, 'Ответ на твой вопрос:\n\n' + answer_text)
     except Exception:
         log.exception('Support reply to %s failed', user_id)
         await message.reply('Не удалось доставить ответ участнику. Проверь, не заблокировал ли он бота.')
         return
     async with DB.sessions() as s:
         s.add(SupportMirror(group_message_id=message.message_id, case_id=case_id))
+        s.add(SupportSentReply(group_message_id=message.message_id, case_id=case_id,
+                               participant_id=user_id, participant_message_id=delivered.message_id,
+                               text_editable=True))
         await s.commit()
-    await message.reply('Ответ доставлен участнику от имени Майи.')
+    await message.reply('Ответ доставлен участнику от имени Майи. Для исправления ответь на своё сообщение командой /edit_reply новый текст.')
 
 
 # Operational codes are restricted to the defined dates/times in Moscow.

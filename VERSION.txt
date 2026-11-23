@@ -1,1 +1,1 @@
-ATLANTIS v0.14 — admin stats, no originals button, whitelist 81, 2026-11-22
+ATLANTIS v0.16 — explicit /answer for support replies, editable delivered answers, 2026-11-22

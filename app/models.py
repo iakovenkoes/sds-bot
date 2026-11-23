@@ -107,6 +107,17 @@ class SupportMirror(Base):
     case_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('support_cases.id'), index=True)
 
 
+class SupportSentReply(Base):
+    """Persist IDs of participant-facing support answers for later Telegram edits."""
+    __tablename__ = 'support_sent_replies'
+    group_message_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    case_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('support_cases.id'), index=True)
+    participant_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('users.id'))
+    participant_message_id: Mapped[int] = mapped_column(BigInteger)
+    text_editable: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class TripAttendee(Base):
     """Organizer-supplied participant allowlist. One full name can be claimed by one Telegram account."""
     __tablename__ = 'trip_attendees'
