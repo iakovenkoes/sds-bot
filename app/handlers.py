@@ -469,6 +469,49 @@ async def admin_stats_back(call: CallbackQuery):
         reply_markup=kb.admin_menu(is_super=call.from_user.id == SETTINGS.super_admin_id))
 
 
+@router.callback_query(F.data == 'admin:points_export')
+async def admin_points_export(call: CallbackQuery):
+    """Read-only current balance export, including users with zero points."""
+    if call.message.chat.type != 'private' or not await is_admin(call.from_user.id):
+        await call.answer('Нет доступа', show_alert=True)
+        return
+    await call.answer()
+    async with DB.sessions() as session:
+        totals = (await session.execute(
+            select(User.full_name, User.username, User.id,
+                   func.coalesce(func.sum(PointEntry.delta), 0).label('balance'))
+            .outerjoin(PointEntry, PointEntry.user_id == User.id)
+            .group_by(User.id, User.full_name, User.username)
+            .order_by(func.coalesce(func.sum(PointEntry.delta), 0).desc(),
+                      User.full_name, User.id)
+        )).all()
+    stream = io.BytesIO()
+    book = xlsxwriter.Workbook(stream, {'in_memory': True})
+    sheet = book.add_worksheet('Баллы участников')
+    header = book.add_format({'bold': True, 'bg_color': '#E2EFE9', 'border': 1})
+    number = book.add_format({'num_format': '0.0'})
+    for column, label in enumerate(('ФИО', 'Telegram', 'Telegram ID', 'Всего баллов')):
+        sheet.write(0, column, label, header)
+    sheet.set_column('A:A', 39)
+    sheet.set_column('B:B', 26)
+    sheet.set_column('C:C', 22)
+    sheet.set_column('D:D', 18)
+    for row_num, (full_name, username, telegram_id, balance) in enumerate(totals, 1):
+        sheet.write_string(row_num, 0, full_name or '')
+        sheet.write_string(row_num, 1, ('@' + username) if username else '')
+        sheet.write_string(row_num, 2, str(telegram_id))
+        sheet.write_number(row_num, 3, float(balance), number)
+    sheet.freeze_panes(1, 0)
+    sheet.autofilter(0, 0, max(len(totals), 1), 3)
+    book.close()
+    filename = f'ATLANTIS_points_{rules.current_msk():%Y-%m-%d_%H-%M}.xlsx'
+    await call.message.answer_document(
+        BufferedInputFile(stream.getvalue(), filename=filename),
+        caption=f'Баллы участников на текущий момент. Пользователей: {len(totals)}. '
+                'Непроверенные задания «Пути героя» не начислены.'
+    )
+
+
 
 @router.message(Input.name)
 async def name_receive(message: Message, state: FSMContext):
@@ -576,13 +619,19 @@ async def show_hero(message: Message, actor, state: FSMContext) -> None:
         await formatted_answer(message,'Предпросмотр заданий для главного администратора.')
     # Two intact high-resolution PNG cards, delivered as one Telegram photo album.
     # Telegram can compress photos. An additional document button supplies originals.
-    if now < rules.PRETRIP_END or preview_enabled(actor.id):
+    cards = Path(__file__).resolve().parent.parent / 'data' / 'hero_cards'
+    if not cards.is_dir():
         cards = Path(__file__).resolve().parent.parent / 'data' / 'hero_cards'
-        images = [cards / 'archive_recon.png', cards / 'assembly.png']
-        if all(img.is_file() for img in images):
-            await message.answer_media_group(media=[InputMediaPhoto(media=FSInputFile(img)) for img in images])
-    await formatted_answer(message,'Путь героя\nВыбери блок. Погружение откроется в день выезда.',
-                         reply_markup=kb.stages(preview=preview_enabled(actor.id)))
+    # Never reveal the immersion card before 28 Nov 10:00 Moscow time,
+    # including in the superadmin preview. Gate the image as well as the stage.
+    if rules.ACTION_START <= now < rules.ACTION_END:
+        immersion = cards / 'immersion.png'
+        if immersion.is_file():
+            await message.answer_photo(FSInputFile(immersion), caption='Погружение — карточка заданий')
+    await formatted_answer(call.message if hasattr(call, 'message') else message,
+        'Путь героя\nВыбери блок.' +
+        (' Погружение откроется в день выезда.' if now < rules.ACTION_START else ''),
+        reply_markup=kb.stages(preview=preview_enabled(actor.id)))
 
 
 @router.callback_query(F.data == 'hero')

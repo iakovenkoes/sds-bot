@@ -91,7 +91,8 @@ def admin_menu(is_super: bool = False) -> K:
             [('Управление кодовыми словами', 'admin:codes')],
             [('Срочная рассылка', 'admin:urgent')],
             [('Выгрузить регистрации', 'admin:export')],
-            [('Найти участника', 'admin:find')]]
+            [('Найти участника', 'admin:find')],
+            [('Выгрузить баллы участников', 'admin:points_export')]]
     if is_super:
         rows.append([('Группа вопросов Майе', 'admin:support')])
     rows.append([('Меню участника', 'menu')])
