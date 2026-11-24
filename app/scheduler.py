@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from aiogram import Bot
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.dialects.postgresql import insert
 
 from app.models import BotSetting, PlannedMessage, Registration, TripAttendee, User
@@ -71,12 +71,16 @@ async def enqueue_due_events(db, now=None):
             continue
         marker_key = 'auto_v010_' + item['id']
         async with db.sessions() as session:
-            if await session.get(BotSetting, marker_key) is not None:
+            claim = await session.execute(insert(BotSetting).values(
+                key=marker_key, value='processing'
+            ).on_conflict_do_nothing(index_elements=['key']).returning(BotSetting.key))
+            if claim.scalar_one_or_none() is None:
                 continue
+            marker = await session.get(BotSetting, marker_key)
             # Do not surprise users with historical broadcasts on a delayed deployment.
             # Late-join story drops are separately queued by /start below.
             if now - when > timedelta(minutes=30):
-                session.add(BotSetting(key=marker_key, value='skipped_late'))
+                marker.value = 'skipped_late'
                 await session.commit()
                 LOG.warning('Skipped stale event %s (deployment was too late)', item['id'])
                 continue
@@ -85,7 +89,7 @@ async def enqueue_due_events(db, now=None):
                 await session.execute(insert(PlannedMessage).values(
                     user_id=uid, kind='auto:'+item['id'], due_at=when
                 ).on_conflict_do_nothing(index_elements=['user_id', 'kind']))
-            session.add(BotSetting(key=marker_key, value=f'queued:{len(ids)}'))
+            marker.value = f'queued:{len(ids)}'
             await session.commit()
             LOG.info('Enqueued %s for %d users', item['id'], len(ids))
 
@@ -104,14 +108,16 @@ async def queue_late_join_story(session, user_id, now=None):
 
 
 async def deliver_pending(bot: Bot, db):
-    async with db.sessions() as session:
-        items = (await session.scalars(select(PlannedMessage).where(
-            PlannedMessage.delivered_at.is_(None),
-            PlannedMessage.due_at <= datetime.now(timezone.utc)
-        ).order_by(PlannedMessage.due_at, PlannedMessage.id).limit(30).with_for_update(skip_locked=True))).all()
-        for item in items:
-            if item.kind != 'intro' and not item.kind.startswith('auto:'):
-                continue
+    # Keep each row locked until its own delivery transaction finishes.
+    for _ in range(30):
+        async with db.sessions() as session:
+            item = await session.scalar(select(PlannedMessage).where(
+                PlannedMessage.delivered_at.is_(None),
+                PlannedMessage.due_at <= datetime.now(timezone.utc),
+                or_(PlannedMessage.kind == 'intro', PlannedMessage.kind.startswith('auto:'))
+            ).order_by(PlannedMessage.due_at, PlannedMessage.id).limit(1).with_for_update(skip_locked=True))
+            if item is None:
+                return
             try:
                 if item.kind == 'intro':
                     from app.messages import INSTRUCTION
@@ -119,17 +125,13 @@ async def deliver_pending(bot: Bot, db):
                 else:
                     content = payload_for(item.kind[5:])
                 await bot.send_message(item.user_id, content, parse_mode='HTML')
-                item.delivered_at = datetime.now(timezone.utc)
-                await session.commit()  # persist each successful delivery
             except Exception as exc:
                 LOG.warning('Delivery %s to %s failed: %s', item.kind, item.user_id, exc)
-                await session.rollback()
-                # Back off failed/blocked recipients so they don't starve the queue.
-                retry = await session.get(PlannedMessage, item.id)
-                if retry and retry.delivered_at is None:
-                    retry.due_at = datetime.now(timezone.utc) + timedelta(minutes=2)
-                    await session.commit()
-            await asyncio.sleep(0.08)
+                item.due_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+            else:
+                item.delivered_at = datetime.now(timezone.utc)
+            await session.commit()
+        await asyncio.sleep(0.08)
 
 
 async def scheduler_worker(bot: Bot, db):
