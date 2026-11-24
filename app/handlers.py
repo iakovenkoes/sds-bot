@@ -628,7 +628,7 @@ async def show_hero(message: Message, actor, state: FSMContext) -> None:
         immersion = cards / 'immersion.png'
         if immersion.is_file():
             await message.answer_photo(FSInputFile(immersion), caption='Погружение — карточка заданий')
-    await formatted_answer(call.message if hasattr(call, 'message') else message,
+    await formatted_answer(message,
         'Путь героя\nВыбери блок.' +
         (' Погружение откроется в день выезда.' if now < rules.ACTION_START else ''),
         reply_markup=kb.stages(preview=preview_enabled(actor.id)))
