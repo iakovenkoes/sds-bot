@@ -1,0 +1,16 @@
+name: sds-bot
+
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://postgres:${SDS_DATABASE_PASSWORD_URLENCODED:?Set SDS_DATABASE_PASSWORD_URLENCODED in .env}@sds:5432/sds"
+    networks:
+      - postgres
+
+networks:
+  postgres:
+    name: sds-network
+    external: true
